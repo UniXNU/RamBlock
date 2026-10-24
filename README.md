@@ -1,7 +1,7 @@
-# NativeRamBlock
+# RamBlock
 
-RAM block storage driver. Provides block devices from RAM and a persistent Data overlay.
+RAM-backed block device and sparse seed storage.
 
-Current state: used for the RAM-backed Data volume and the optional persistent overlay.
+used for the RAM-backed Data volume and the optional persistent overlay.
 
-Linked into XNU by `unixnu build kernel`.
+Build and interface details: [documentation](https://unixnu.com/drivers/ram-block). Component sources and dependencies: [catalog](https://unixnu.com/reference/components).
