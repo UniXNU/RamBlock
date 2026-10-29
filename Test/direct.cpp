@@ -34,7 +34,7 @@ int main() {
   uint8_t digest[32] = {9};
   Medium m(windowBlocks(pages));
   std::vector<uint8_t> bits(bitmapBlocks(pages) * kBlock), stage(8 * kBlock);
-  Overlay ov; assert(ov.open(m, pages, digest, false, bits.data()) == Open::Fresh);
+  Overlay ov; assert(ov.open(m, pages, digest, false, bits.data(), true) == Open::Fresh);
   bool storeError = false;
   std::vector<uint8_t> io(300 * 1024);
   for (int op = 0; op < 4000; ++op) {

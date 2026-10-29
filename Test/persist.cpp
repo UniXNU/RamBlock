@@ -36,9 +36,11 @@ int main() {
   const size_t bytes = bitmapBlocks(pages) * kBlock;
   std::vector<uint8_t> bits(bytes);
   auto fresh = [&] { return std::vector<uint8_t>(bytes); };
-  // Blank medium: read-only open must not write and reports Blank; read-write initialises it.
+  // Blank medium: read-only open must not write and reports Blank; read-write keeps it untouched without a reset (Kept) and
+  // initialises it with one (Install and boot).
   { Overlay o; assert(o.open(m, pages, seedA, true, bits.data()) == Open::Blank && m.writes == 0 && !o.active && o.header == 1); }
-  Overlay o; assert(o.open(m, pages, seedA, false, bits.data()) == Open::Fresh && o.active && o.present == 0 && o.generation == 1);
+  { Overlay o; assert(o.open(m, pages, seedA, false, bits.data()) == Open::Kept && m.writes == 0 && !o.active && o.header == 1); }
+  Overlay o; assert(o.open(m, pages, seedA, false, bits.data(), true) == Open::Fresh && o.active && o.present == 0 && o.generation == 1);
   m.fua = true;                                         // from here on writes are durable when they return
   // Single pages and a run; the bitmap reaches the medium inside the same call.
   assert(o.writePage(m, 0, pageOf(0x11).data()) && o.writePage(m, 40000, pageOf(0x22).data()) && o.writePage(m, pages - 1, pageOf(0x33).data()));
@@ -56,10 +58,13 @@ int main() {
   }
   // Rewriting a present page changes no bitmap block.
   { unsigned before = m.writes; assert(o.writePage(m, 0, pageOf(0x12).data()) && m.writes == before + 1 && o.present == 11); }
-  // A different seed makes the overlay stale: it is replaced, not applied.
+  // A different seed makes the overlay stale: never applied; kept untouched without a reset, replaced with one.
   { Medium copy = m; Overlay r; auto b2 = fresh();
     assert(r.open(copy, pages, seedB, true, b2.data()) == Open::Blank && r.header == 3 && r.present == 0);
-    assert(r.open(copy, pages, seedB, false, b2.data()) == Open::Fresh && r.generation == 2 && r.present == 0); }
+    const unsigned before = copy.writes;
+    assert(r.open(copy, pages, seedB, false, b2.data()) == Open::Kept && copy.writes == before && !r.active && r.header == 3);
+    Overlay q; auto b3 = fresh(); assert(q.open(copy, pages, seedA, true, b3.data()) == Open::Resumed && q.present == 11);
+    assert(r.open(copy, pages, seedB, false, b2.data(), true) == Open::Fresh && r.generation == 2 && r.present == 0); }
   // An explicit reset discards a valid overlay for the same seed.
   { Medium copy = m; Overlay r; auto b2 = fresh();
     assert(r.open(copy, pages, seedA, false, b2.data(), true) == Open::Fresh && r.present == 0 && r.generation == 2);
@@ -74,17 +79,18 @@ int main() {
     assert(w.open(t, pages, seedA, false, b2.data()) == Open::Resumed);
     t.failWriteAt = t.writes + 1; assert(!w.writePage(t, 7, pageOf(0x66).data()));
     Overlay r; auto b3 = fresh(); assert(r.open(t, pages, seedA, true, b3.data()) == Open::Resumed && !r.has(7) && r.present == 11); }
-  // Damaged header (flip a bit): reported as damaged, read-write open reinitialises with a higher generation.
+  // Damaged header (flip a bit): reported as damaged, kept without a reset, reinitialised with one.
   { Medium t = m; t.durable[20] ^= 1; Overlay r; auto b2 = fresh();
     assert(r.open(t, pages, seedA, true, b2.data()) == Open::Blank && r.header == 2);
-    assert(r.open(t, pages, seedA, false, b2.data()) == Open::Fresh && r.present == 0); }
+    assert(r.open(t, pages, seedA, false, b2.data()) == Open::Kept && r.header == 2);
+    assert(r.open(t, pages, seedA, false, b2.data(), true) == Open::Fresh && r.present == 0); }
   // Bits beyond the last page are corruption.
   { Medium t = m; Overlay r; auto b2 = fresh();
     t.durable[1 * kBlock + 2 * kBlock + 100] |= 0x80;    // inside bitmap block 3 (last), page index >= pages
     assert(r.open(t, pages, seedA, true, b2.data()) == Open::Failed); }
   // Failed initialisation leaves no valid header.
   { Medium t(windowBlocks(pages)); t.failSyncAt = 0; Overlay r; auto b2 = fresh();
-    assert(r.open(t, pages, seedA, false, b2.data()) == Open::Failed); t.powerLoss();
+    assert(r.open(t, pages, seedA, false, b2.data(), true) == Open::Failed); t.powerLoss();
     Overlay q; assert(q.open(t, pages, seedA, true, b2.data()) == Open::Blank && q.header == 1); }
-  puts("PASS: overlay header, bitmap, runs, write order, stale seed, reset, failed writes");
+  puts("PASS: overlay header, bitmap, runs, write order, stale seed kept, reset only on request, failed writes");
 }

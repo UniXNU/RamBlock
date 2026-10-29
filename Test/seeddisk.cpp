@@ -56,7 +56,7 @@ int main() {
   // The overlay on a medium of the full window size: header + bitmap for 16.7M pages stay small in memory (the bitmap is pages/8 bytes).
   Medium m; std::vector<uint8_t> bits(bitmapBlocks(pages) * kBlock); uint8_t digest[32] = {7};
   assert(bitmapBlocks(pages) == 512);
-  Overlay ov; assert(ov.open(m, pages, digest, false, bits.data()) == Open::Fresh && windowBlocks(pages) == 1 + 512 + pages);
+  Overlay ov; assert(ov.open(m, pages, digest, false, bits.data(), true) == Open::Fresh && windowBlocks(pages) == 1 + 512 + pages);
   std::map<uint64_t, std::vector<uint8_t>> oracle;        // page index -> content, for pages that differ from the seed
   std::vector<uint8_t> io(200000), stage(32 * kBlock); bool storeError = false; srand(3);
   auto seedPage = [&](uint64_t i) { const uint8_t *p = seed.find(i); return p ? std::vector<uint8_t>(p, p + 4096) : std::vector<uint8_t>(4096, 0); };
