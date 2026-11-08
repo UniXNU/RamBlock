@@ -14,6 +14,7 @@
 #include <machine/machine_routines.h>
 #include <vm/vm_kern.h>
 #include <kern/clock.h>
+#include <kern/thread_call.h>
 #include <pexpert/pexpert.h>
 #include "SparseDisk.h"
 #include "PersistOverlay.h"
@@ -36,12 +37,22 @@ unsigned native_ufs_store_mode(void) __attribute__((weak_import));
 int native_ufs_store_open(uint64_t, uint64_t *, const char **) __attribute__((weak_import));
 int native_ufs_store_read(uint64_t, uint32_t, void *) __attribute__((weak_import));
 int native_ufs_store_write(uint64_t, uint32_t, const void *) __attribute__((weak_import));
+// Write without forced unit access (the device's write cache may hold it until native_ufs_store_sync). Present: write back.
+int native_ufs_store_write_cached(uint64_t, uint32_t, const void *) __attribute__((weak_import));
 int native_ufs_store_sync(void) __attribute__((weak_import));
 unsigned native_ufs_store_gpt_check(void) __attribute__((weak_import));
 // Diagnostics. state: 0 off, 1 blank (read-only probe), 2 resumed, 3 fresh (Install and boot), 4 refused/failed, 5 degraded after an I/O
 // error, 6 resumed read-only (probe), 7 kept: the store holds no Data of this seed and no reset was asked, so it is left untouched and
 // this boot's Data runs from the seed alone (header: why). header: persist::checkHeader result.
 volatile uint32_t native_data_persist_state = 0, native_data_persist_header = 9, native_data_persist_gpt = 0xff, native_data_persist_gpt_after = 0xff;
+// Data disk I/O, in mach_absolute_time ticks: requests and bytes by direction, time from entry to completion (gate wait included),
+// time waiting for the gate, the longest request; the disk's synchronize (flushes, their time, bitmap blocks written, those the
+// idle timer started). native_data_write_back: 1 when the store runs write back (a write cache, made durable by synchronize).
+volatile uint64_t native_data_io_reads = 0, native_data_io_read_bytes = 0, native_data_io_read_ticks = 0,
+                  native_data_io_writes = 0, native_data_io_write_bytes = 0, native_data_io_write_ticks = 0,
+                  native_data_io_gate_ticks = 0, native_data_io_max_ticks = 0,
+                  native_data_flushes = 0, native_data_flush_ticks = 0, native_data_flush_blocks = 0, native_data_timer_flushes = 0;
+volatile uint32_t native_data_write_back = 0;
 volatile uint64_t native_data_persist_pages = 0, native_data_persist_loaded = 0, native_data_persist_writes = 0,
                   native_data_persist_syncs = 0, native_data_persist_errors = 0, native_data_persist_first_lba = 0,
                   native_data_persist_present = 0;
@@ -66,11 +77,58 @@ class NativeRamBlock : public IOBlockStorageDevice {
   // Direct mode (the store is open read-write): changed pages live in the store window only, never in RAM; reads of them go to the
   // window. A failed store write stops all further writes (a page the system was told is written must be on the medium).
   bool direct = false, directFailed = false;
+  // Write back (direct mode only, unless sheng-data-fua=1): page writes may stay in the device's write cache; the disk reports a
+  // write cache, and its synchronize (or the idle timer, kFlushSeconds after the first write since the last flush) makes the pages
+  // and then their bitmap blocks durable (PersistOverlay.h flush). A crash loses at most the writes since the last flush.
+  bool writeBack = false, flushArmed = false, unflushed = false;
+  uint8_t *dirtyBits = nullptr;
+  uint64_t dirtyBytes = 0;
+  thread_call_t flushCall = nullptr;
+  static constexpr uint32_t kFlushSeconds = 5;
   struct StoreOps {
+    bool cached = false;
     bool read(uint64_t b, uint32_t n, void *d) { __atomic_fetch_add(&native_data_persist_loaded, n, __ATOMIC_RELAXED); return native_ufs_store_read(b, n, d); }
-    bool write(uint64_t b, uint32_t n, const void *s) { return native_ufs_store_write(b, n, s); }
+    bool write(uint64_t b, uint32_t n, const void *s) { return cached ? native_ufs_store_write_cached(b, n, s) : native_ufs_store_write(b, n, s); }
     bool sync() { return native_ufs_store_sync(); }
   };
+  static bool fuaRequested() { uint32_t v = 0; return PE_parse_boot_argn("sheng-data-fua", &v, sizeof v) && v == 1; }
+  // Gate held. Makes the written pages and their bitmap blocks durable; a failure stops all further writes, as a failed store write does.
+  bool flushLocked(bool timer) {
+    if (!writeBack || !overlay.active) return true;
+    if (directFailed) return false;
+    const uint64_t t0 = mach_absolute_time();
+    StoreOps store; store.cached = true;
+    uint64_t blocks = 0;
+    const bool ok = overlay.flush(store, &blocks);
+    __atomic_fetch_add(&native_data_flushes, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&native_data_flush_ticks, mach_absolute_time() - t0, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&native_data_flush_blocks, blocks, __ATOMIC_RELAXED);
+    if (timer) __atomic_fetch_add(&native_data_timer_flushes, 1, __ATOMIC_RELAXED);
+    native_data_persist_present = overlay.present;
+    if (!ok) {
+      directFailed = true;
+      native_data_persist_state = 5;
+      __atomic_fetch_add(&native_data_persist_errors, 1, __ATOMIC_RELAXED);
+    } else {
+      unflushed = false;
+    }
+    return ok;
+  }
+  static void flushTimer(thread_call_param_t self, thread_call_param_t) {
+    NativeRamBlock *disk = static_cast<NativeRamBlock *>(self);
+    IOLockLock(disk->gate);
+    disk->flushArmed = false;
+    if (disk->online && disk->unflushed) disk->flushLocked(true);
+    IOLockUnlock(disk->gate);
+  }
+  // Gate held: start the idle timer once there is a write since the last flush and the timer is not already running.
+  void armFlush() {
+    if (!writeBack || !flushCall || flushArmed || !unflushed) return;
+    uint64_t deadline = 0;
+    clock_interval_to_deadline(kFlushSeconds, kSecondScale, &deadline);
+    flushArmed = true;
+    thread_call_enter_delayed(flushCall, deadline);
+  }
   void persistFailed() { overlay.active = false; native_data_persist_state = 5; __atomic_fetch_add(&native_data_persist_errors, 1, __ATOMIC_RELAXED); }
 public:
   // Called once, before the Data volume is mounted (native_ram_block_volume_seed): open the store window, put the pages that
@@ -147,6 +205,22 @@ public:
             overlay.active = false;
           }
         }
+        // Direct and read-write: write back when the store offers cached writes and sheng-data-fua=1 does not ask for write through.
+        if (direct && overlay.active && !overlay.readOnly && &native_ufs_store_write_cached && !fuaRequested()) {
+          dirtyBytes = persist::bitmapBlocks(pages);
+          dirtyBits = static_cast<uint8_t *>(IOMallocZero(dirtyBytes));
+          flushCall = dirtyBits ? thread_call_allocate(flushTimer, this) : nullptr;
+          if (dirtyBits && flushCall) {
+            overlay.dirty = dirtyBits;
+            overlay.dirtyBlocks = 0;
+            writeBack = true;
+            native_data_write_back = 1;
+          } else {
+            if (dirtyBits) IOFree(dirtyBits, dirtyBytes);
+            dirtyBits = nullptr; dirtyBytes = 0;
+            if (flushCall) { thread_call_free(flushCall); flushCall = nullptr; }
+          }
+        }
         native_data_persist_present = overlay.present;
         native_data_persist_gpt_after = native_ufs_store_gpt_check();
       }
@@ -181,11 +255,16 @@ public:
   IOReturn reportWriteProtection(bool *value) override { *value = false; return kIOReturnSuccess; }
   IOReturn doSynchronizeCache() override {
     if (!online) return kIOReturnNotReady;
-    // Every changed page is on the medium, with its bitmap bit, before its write completed (PersistOverlay.h): nothing to flush.
-    return kIOReturnSuccess;
+    // Write through: every changed page is on the medium, with its bitmap bit, before its write completed (PersistOverlay.h).
+    if (!writeBack) return kIOReturnSuccess;
+    // Write back: the pages written so far, then their bitmap blocks. Barrier and full requests are both served as a full flush.
+    IOLockLock(gate);
+    const bool ok = flushLocked(false);
+    IOLockUnlock(gate);
+    return ok ? kIOReturnSuccess : kIOReturnIOError;
   }
   IOReturn doSynchronize(UInt64, UInt64, IOOptionBits) override { return doSynchronizeCache(); }
-  IOReturn getWriteCacheState(bool *value) override { *value = false; return kIOReturnSuccess; }
+  IOReturn getWriteCacheState(bool *value) override { *value = writeBack; return kIOReturnSuccess; }
   IOReturn setWriteCacheState(bool) override { return kIOReturnUnsupported; }
   IOReturn doAsyncReadWrite(IOMemoryDescriptor *, UInt64, UInt64, IOStorageAttributes *, IOStorageCompletion *) override;
 };
@@ -263,7 +342,9 @@ IOReturn NativeRamBlock::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 blo
       (buffer->getDirection() != kIODirectionIn && buffer->getDirection() != kIODirectionOut)) return kIOReturnBadArgument;
   if (!gate) return kIOReturnNotReady;
   const uint64_t bytes = count * 512;
+  const uint64_t entered = mach_absolute_time();
   IOLockLock(gate);
+  const uint64_t gated = mach_absolute_time();
   if (!online) { IOLockUnlock(gate); return kIOReturnNotReady; }
   uint64_t actual;bool noMemory=false;
   if(isBig && !direct) {
@@ -306,7 +387,7 @@ IOReturn NativeRamBlock::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 blo
         uint64_t read(uint64_t at,void *p,uint64_t n){return buffer->readBytes(at,p,n);}
         uint64_t copy(uint64_t at,const void *p,uint64_t n){return buffer->writeBytes(at,p,n);}
       } bops={buffer};
-      StoreOps store;bool storeError=false;
+      StoreOps store;store.cached=writeBack;bool storeError=false;
       if(write && directFailed)actual=0;
       else actual=isBig?directDiskIO(big,overlay,store,stage,kStagePages,write,block*512,bytes,bops,&storeError)
                        :directDiskIO(sparse,overlay,store,stage,kStagePages,write,block*512,bytes,bops,&storeError);
@@ -315,6 +396,8 @@ IOReturn NativeRamBlock::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 blo
         native_data_persist_state=5;__atomic_fetch_add(&native_data_persist_errors,1,__ATOMIC_RELAXED);
       }
       if(write && actual){__atomic_fetch_add(&native_data_persist_writes,(actual+4095)/4096,__ATOMIC_RELAXED);__atomic_fetch_add(&native_data_persist_syncs,1,__ATOMIC_RELAXED);native_data_persist_present=overlay.present;}
+      // Write back: durable on the next synchronize, or on the idle timer.
+      if(write && actual && writeBack){unflushed=true;armFlush();}
     } else {
     actual=ramSparseIO(sparse,write,block*512,bytes,ops,noMemory);
     }
@@ -343,6 +426,18 @@ IOReturn NativeRamBlock::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 blo
   }
   IOReturn status = actual == bytes ? kIOReturnSuccess : noMemory ? kIOReturnNoMemory : kIOReturnIOError;
   if (status) __atomic_fetch_add(&native_ram_block_failures, 1, __ATOMIC_RELAXED);
+  const uint64_t left = mach_absolute_time(), spent = left - entered;
+  if (buffer->getDirection() == kIODirectionOut) {
+    __atomic_fetch_add(&native_data_io_writes, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&native_data_io_write_bytes, bytes, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&native_data_io_write_ticks, spent, __ATOMIC_RELAXED);
+  } else {
+    __atomic_fetch_add(&native_data_io_reads, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&native_data_io_read_bytes, bytes, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&native_data_io_read_ticks, spent, __ATOMIC_RELAXED);
+  }
+  __atomic_fetch_add(&native_data_io_gate_ticks, gated - entered, __ATOMIC_RELAXED);
+  if (spent > native_data_io_max_ticks) native_data_io_max_ticks = spent;   // gate held: no other writer
   IOLockUnlock(gate);
   completion->action(completion->target, completion->parameter, status, actual);
   return kIOReturnSuccess;
@@ -350,12 +445,16 @@ IOReturn NativeRamBlock::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 blo
 
 void NativeRamBlock::stop(IOService *provider)
 {
-  if (gate) { IOLockLock(gate); online = false; IOLockUnlock(gate); }
+  if (flushCall) thread_call_cancel_wait(flushCall);
+  // Write back: what is still unflushed reaches the medium before the disk goes away.
+  if (gate) { IOLockLock(gate); if (unflushed) flushLocked(false); online = false; IOLockUnlock(gate); }
   IOBlockStorageDevice::stop(provider);
 }
 
 void NativeRamBlock::free()
 {
+  if (flushCall) { thread_call_cancel_wait(flushCall); thread_call_free(flushCall); flushCall = nullptr; }
+  if (dirtyBits) { IOFree(dirtyBits, dirtyBytes); dirtyBits = nullptr; dirtyBytes = 0; overlay.dirty = nullptr; }
   if (overlayBits) { IOFree(overlayBits, persist::bitmapBlocks(sparse.bytes / 4096) * persist::kBlock); overlayBits = nullptr; }
   if (stage) { IOFree(stage, kStagePages * persist::kBlock); stage = nullptr; }
   if (isBig) {
