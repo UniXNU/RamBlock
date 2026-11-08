@@ -81,7 +81,8 @@ struct Overlay {
   bool readOnly = true, active = false;
   int header = -1;                 // checkHeader result at open
 
-  bool has (uint64_t i) const { return bitmap[i >> 3] >> (i & 7) & 1; }
+  // Readers may test bits while a writer commits others (commitRun under the caller's lock), so bytes are read and set atomically.
+  bool has (uint64_t i) const { return __atomic_load_n (&bitmap[i >> 3], __ATOMIC_ACQUIRE) >> (i & 7) & 1; }
 
   // `readOnly`: never write; a stale or blank window is reported (Blank) and left alone. Otherwise a window without this seed's
   // overlay is initialised only with `reset` (bitmap first, header last, so a tear leaves no valid header), and kept as it is
@@ -138,8 +139,21 @@ struct Overlay {
   // On false the run may be partly on the medium but no bit names a page that is not; the caller must stop using the overlay.
   template <class Ops> bool writeRun (Ops &ops, uint64_t index, uint32_t count, const void *data)
   {
+    return writePages (ops, index, count, data) && commitRun (ops, index, count);
+  }
+
+  // The two halves of writeRun, for callers that run writes concurrently: writePages needs no lock (it only writes the window's
+  // page blocks); commitRun, after it, sets the bits and writes or marks their bitmap blocks, and must be serialized by the caller
+  // (one commit at a time, and never during flush), so that bitmap blocks reach the medium in the order their bits were set.
+  template <class Ops> bool writePages (Ops &ops, uint64_t index, uint32_t count, const void *data)
+  {
     if (readOnly || !active || !count || index >= pages || count > pages - index) return false;
-    if (!ops.write (pageBlock (pages, index), count, data)) return false;
+    return ops.write (pageBlock (pages, index), count, data);
+  }
+
+  template <class Ops> bool commitRun (Ops &ops, uint64_t index, uint32_t count)
+  {
+    if (readOnly || !active || !count || index >= pages || count > pages - index) return false;
     uint64_t firstBlock = ~0ULL, lastBlock = 0;
     for (uint64_t i = index; i < index + count; ++i) {
       if (has (i)) continue;
@@ -149,7 +163,7 @@ struct Overlay {
     }
     // Set the bits only after the pages are written; in write through the bitmap blocks follow before this call returns.
     for (uint64_t i = index; i < index + count; ++i)
-      if (!has (i)) { bitmap[i >> 3] |= uint8_t (1 << (i & 7)); ++present; }
+      if (!has (i)) { __atomic_fetch_or (&bitmap[i >> 3], uint8_t (1 << (i & 7)), __ATOMIC_RELEASE); ++present; }
     if (firstBlock == ~0ULL) return true;
     if (dirty) {
       for (uint64_t b = firstBlock; b <= lastBlock; ++b) if (!dirty[b]) { dirty[b] = 1; ++dirtyBlocks; }
