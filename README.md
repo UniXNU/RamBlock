@@ -16,7 +16,7 @@ the flush lock exclusive, so every bit it writes names a page its first sync mad
 durable. Staging buffers come from a pool of eight.
 
 The store runs write back when the board offers cached writes, unless
-`sheng-data-fua=1`: a synchronize, or the idle timer 5 s after a write, makes the
+`data-fua=1`: a synchronize, or the idle timer 5 s after a write, makes the
 pages and then their bitmap blocks durable. A synchronize with no write since
 the last flush sends no command.
 
