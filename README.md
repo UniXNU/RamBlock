@@ -4,6 +4,11 @@ RAM-backed block device and sparse seed storage.
 
 used for the RAM-backed Data volume and the optional persistent overlay.
 
+The device reports a solid state medium (`Device Characteristics`, `Medium
+Type`), which XNU reads through DKIOCISSOLIDSTATE for its I/O throttle periods,
+read-ahead and page-in cluster sizes, and the swap thresholds when the swap
+files live on it.
+
 Build and interface details: [documentation](https://unixnu.com/drivers/ram-block). Component sources and dependencies: [catalog](https://unixnu.com/reference/components).
 
 ## Direct mode

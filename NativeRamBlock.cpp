@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 #include <IOKit/IOLib.h>
 #include <IOKit/storage/IOBlockStorageDevice.h>
+#include <IOKit/storage/IOStorageDeviceCharacteristics.h>
 #include <IOKit/IODeviceTreeSupport.h>
 #include <libkern/c++/OSData.h>
 #include <libkern/c++/OSDictionary.h>
@@ -404,6 +405,16 @@ bool NativeRamBlock::start(IOService *provider)
   native_ram_block_bytes = logical;
   native_ram_block_sparse=(sparse.pages||isBig)?1:0;
   native_ram_block_resident_bytes=isBig?big.resident:sparse.pages?sparse.resident:logical;
+  // The medium is memory or, with the persistent store, flash: neither seeks. IOMediaBSDClient answers DKIOCISSOLIDSTATE from this
+  // dictionary, found from any media above this device; without it XNU treats the disk as rotating (the swap thresholds of a hard
+  // disk when the swap files live here, throttle periods, read-ahead and page-in cluster sizes, the mount's MNTK_SSD).
+  OSDictionary *characteristics = OSDictionary::withCapacity(1);
+  OSString *medium = OSString::withCString(kIOPropertyMediumTypeSolidStateKey);
+  if (characteristics && medium && characteristics->setObject(kIOPropertyMediumTypeKey, medium)) {
+    setProperty(kIOPropertyDeviceCharacteristicsKey, characteristics);
+  }
+  OSSafeReleaseNULL(medium);
+  OSSafeReleaseNULL(characteristics);
   online = true;
   native_ram_block_ready = 1;
   registerService();
