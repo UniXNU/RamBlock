@@ -91,7 +91,7 @@ class NativeRamBlock : public IOBlockStorageDevice {
   // Direct mode (the store is open read-write): changed pages live in the store window only, never in RAM; reads of them go to the
   // window. A failed store write stops all further writes (a page the system was told is written must be on the medium).
   bool direct = false, directFailed = false;
-  // Write back (direct mode only, unless sheng-data-fua=1): page writes may stay in the device's write cache; the disk reports a
+  // Write back (direct mode only, unless data-fua=1): page writes may stay in the device's write cache; the disk reports a
   // write cache, and its synchronize (or the idle timer, kFlushSeconds after the first write since the last flush) makes the pages
   // and then their bitmap blocks durable (PersistOverlay.h flush). A crash loses at most the writes since the last flush.
   bool writeBack = false, flushArmed = false, unflushed = false;
@@ -105,7 +105,7 @@ class NativeRamBlock : public IOBlockStorageDevice {
     bool write(uint64_t b, uint32_t n, const void *s) { return cached ? native_ufs_store_write_cached(b, n, s) : native_ufs_store_write(b, n, s); }
     bool sync() { return native_ufs_store_sync(); }
   };
-  static bool fuaRequested() { uint32_t v = 0; return PE_parse_boot_argn("sheng-data-fua", &v, sizeof v) && v == 1; }
+  static bool fuaRequested() { uint32_t v = 0; return PE_parse_boot_argn("data-fua", &v, sizeof v) && v == 1; }
   // Makes the written pages and their bitmap blocks durable; a failure stops all further writes, as a failed store write does. Nothing
   // written since the last flush: every page and bit is already durable, so no command is sent.
   bool flushStore(bool timer) {
@@ -202,10 +202,10 @@ public:
   // Called once, before the Data volume is mounted (native_ram_block_volume_seed): open the store window, put the pages that
   // earlier boots changed back into the sparse disk, and from then on write changed pages through. The seed identity
   // (seedHash) is not affected. Any refusal or error leaves the disk volatile, exactly as without persistence.
-  // sheng-data-reset=1 or 2 (the boot menu's Install and boot) starts the overlay over (the old pages are dropped, not applied); 2 also
+  // data-reset=1 or 2 (the boot menu's Install and boot) starts the overlay over (the old pages are dropped, not applied); 2 also
   // asks for Setup (BootWatchdogPolicy.c). It is the only way the store is made anew: a store of another seed, a blank or a damaged one
   // is kept as it is on any other boot.
-  static bool discardRequested() { uint32_t v = 0; return PE_parse_boot_argn("sheng-data-reset", &v, sizeof v) && (v == 1 || v == 2); }
+  static bool discardRequested() { uint32_t v = 0; return PE_parse_boot_argn("data-reset", &v, sizeof v) && (v == 1 || v == 2); }
   void attachStore() {
     if (!gate) return;
     IOLockLock(gate);
@@ -273,7 +273,7 @@ public:
             overlay.active = false;
           }
         }
-        // Direct and read-write: write back when the store offers cached writes and sheng-data-fua=1 does not ask for write through.
+        // Direct and read-write: write back when the store offers cached writes and data-fua=1 does not ask for write through.
         if (direct && overlay.active && !overlay.readOnly && &native_ufs_store_write_cached && !fuaRequested()) {
           dirtyBytes = persist::bitmapBlocks(pages);
           dirtyBits = static_cast<uint8_t *>(IOMallocZero(dirtyBytes));
