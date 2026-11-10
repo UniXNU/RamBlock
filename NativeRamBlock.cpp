@@ -23,6 +23,9 @@
 
 extern "C" {
 extern unsigned long gPhysBase, gPhysSize;
+// The kernel's release of loader memory (payload-addon-release.patch); absent in a kernel without it.
+bool ml_static_mfree_prepare(vm_offset_t, vm_size_t) __attribute__((weak_import));
+void IODTFreeLoaderInfo(const char *, void *, int);
 int native_ram_block_volume_device(const char *, dev_t *, char *, size_t);
 volatile uint32_t native_ram_block_ready = 0;
 volatile uint64_t native_ram_block_bytes = 0;
@@ -31,6 +34,7 @@ volatile uint64_t native_ram_block_writes = 0;
 volatile uint64_t native_ram_block_failures = 0;
 volatile uint64_t native_ram_block_resident_bytes = 0;
 volatile uint32_t native_ram_block_sparse = 0;
+volatile uint32_t native_ram_block_seed_released = 0;   // pages of the loader's packed seed returned to the VM
 uint8_t native_ram_block_seed_sha256[32];
 // Optional persistence of the changed pages through a board-provided store window (see PersistOverlay.h). All weak: a build
 // without the provider keeps the volatile disk.
@@ -400,6 +404,15 @@ bool NativeRamBlock::start(IOService *provider)
     memory=nullptr;
   }else SHA256_Update(&context, memory, bytes);
   SHA256_Final(seedHash, &context);
+  }
+  // A packed seed was copied page by page into this disk's own memory and hashed from there: nothing reads the loader's
+  // copy again. With boot-payload-release=1 its whole pages go back to the VM the way XNU returns loader memory, and the
+  // range leaves the registry's /chosen/memory-map, so a second start finds no seed instead of freed memory.
+  uint32_t release = 0;
+  if (packedInput && !memory && PE_parse_boot_argn("boot-payload-release", &release, sizeof release) && release == 1 &&
+      ml_static_mfree_prepare && bytes <= INT32_MAX && ml_static_mfree_prepare(ml_static_ptovirt(physical), bytes)) {
+    IODTFreeLoaderInfo("PackedRAMDisk", reinterpret_cast<void *>(physical), static_cast<int>(bytes));
+    native_ram_block_seed_released = static_cast<uint32_t>(bytes >> 12);
   }
   memcpy(native_ram_block_seed_sha256,seedHash,32);
   native_ram_block_bytes = logical;
