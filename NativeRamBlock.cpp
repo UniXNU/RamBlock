@@ -16,7 +16,6 @@
 #include <vm/vm_kern.h>
 #include <kern/clock.h>
 #include <kern/thread_call.h>
-#include <kern/thread.h>
 #include <pexpert/pexpert.h>
 #include "SparseDisk.h"
 #include "PersistOverlay.h"
@@ -233,7 +232,7 @@ public:
         overlayBits = static_cast<uint8_t *>(IOMallocZero(bb * persist::kBlock));
         stage = static_cast<uint8_t *>(IOMallocZero(kStagePages * persist::kBlock));
         StoreOps ops;
-        persist::Open result = overlayBits && stage ? overlay.open(ops, pages, seedHash, mode == 1, overlayBits, !rootContainer() && discardRequested())
+        persist::Open result = overlayBits && stage ? overlay.open(ops, pages, seedHash, mode == 1, overlayBits, discardRequested())
                                                           : persist::Open::Failed;
         native_data_persist_header = static_cast<uint32_t>(overlay.header);
         if (result == persist::Open::Failed) {
@@ -318,36 +317,6 @@ public:
     IOLockLock(gate);bool ready=available();
     if(ready){*base=(sparse.pages||isBig)?0:reinterpret_cast<uint64_t>(memory);*bytes=capacity*512;memcpy(hash,seedHash,32);}
     IOLockUnlock(gate);return ready;
-  }
-  static bool rootContainer() {
-    uint32_t value = 0;
-    return PE_parse_boot_argn("root-container", &value, sizeof(value)) && value == 1;
-  }
-  bool persistentRoot() const { return rootContainer() && online && direct && overlay.active && !overlay.readOnly && !directFailed; }
-  static void publishRoot(void *argument, wait_result_t) {
-    auto *disk = static_cast<NativeRamBlock *>(argument);
-    OSDictionary *matching = IOService::resourceMatching(kIOBSDKey);
-    IOService *resources = matching ? IOService::waitForMatchingService(matching, 30000000000ULL) : nullptr;
-    OSSafeReleaseNULL(matching);
-    if (resources) {
-      resources->release();
-      // The source UFS service records its geometry before starting this disk.
-      disk->attachStore();
-      if (disk->persistentRoot()) {
-        disk->registerService();
-        // launchd discovers Hardware and xART through the iBoot System Container hint.
-        for (unsigned i = 0; i < 300; ++i) {
-          IORegistryEntry *driver = disk->getChildEntry(gIOServicePlane);
-          IORegistryEntry *media = driver ? driver->getChildEntry(gIOServicePlane) : nullptr;
-          if (media && media->metaCast("IOMedia")) {
-            media->setProperty("Content Hint", "69646961-6700-11AA-AA11-00306543ECAC");
-            break;
-          }
-          IOSleep(100);
-        }
-      } else IOLog("NativeRamBlock: root container requires a matching writable persistent store\n");
-    } else IOLog("NativeRamBlock: IOBSD matching timed out\n");
-    disk->release();
   }
   bool start(IOService *) override;
   void stop(IOService *) override;
@@ -461,15 +430,7 @@ bool NativeRamBlock::start(IOService *provider)
   OSSafeReleaseNULL(characteristics);
   online = true;
   native_ram_block_ready = 1;
-  if (rootContainer()) {
-    retain();
-    thread_t thread;
-    if (kernel_thread_start(publishRoot, this, &thread) != KERN_SUCCESS) {
-      this->release();
-      return false;
-    }
-    thread_deallocate(thread);
-  } else registerService();
+  registerService();
   return true;
 }
 
@@ -753,34 +714,4 @@ extern "C" int native_ram_block_volume_seed(const char *uuid,dev_t *device,char 
   if(!base || !bytes || !digest)return 0;
   *base=0;*bytes=0;memset(digest,0,32);
   return selectVolumeSeed(uuid,device,path,size,base,bytes,digest);
-}
-
-// Development root provenance only. This does not authenticate the mutable container's contents.
-extern "C" int native_ram_block_root_device(dev_t device)
-{
-  OSDictionary *matching = IOService::serviceMatching("IOMedia");
-  OSDictionary *properties = OSDictionary::withCapacity(2);
-  OSNumber *mjr = OSNumber::withNumber(static_cast<unsigned>(major(static_cast<uint32_t>(device))), 32);
-  OSNumber *mnr = OSNumber::withNumber(static_cast<unsigned>(minor(static_cast<uint32_t>(device))), 32);
-  bool ready = matching && properties && mjr && mnr && properties->setObject(kIOBSDMajorKey, mjr) &&
-      properties->setObject(kIOBSDMinorKey, mnr) && matching->setObject("IOPropertyMatch", properties);
-  OSSafeReleaseNULL(mjr); OSSafeReleaseNULL(mnr); OSSafeReleaseNULL(properties);
-  OSIterator *iterator = ready ? IOService::getMatchingServices(matching) : nullptr;
-  OSSafeReleaseNULL(matching);
-  if (!iterator) return 0;
-  unsigned count = 0;
-  bool found = false;
-  while (OSObject *object = iterator->getNextObject()) {
-    IOService *media = OSDynamicCast(IOService, object);
-    if (!media) continue;
-    if (++count != 1) { found = false; break; }
-    for (unsigned depth = 0; media && depth < 64; media = media->getProvider(), ++depth) {
-      if (auto *disk = OSDynamicCast(NativeRamBlock, media)) {
-        found = disk->persistentRoot();
-        break;
-      }
-    }
-  }
-  iterator->release();
-  return found && count == 1;
 }
